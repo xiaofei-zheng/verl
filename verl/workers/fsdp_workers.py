@@ -611,8 +611,10 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 cpu_offload = CPUOffloadPolicy(pin_memory=True)
                 self._is_offload_param = False
                 self._is_offload_optimizer = False
+            elif role == "actor":
+                cpu_offload = None
             else:
-                cpu_offload = None if role == "actor" else CPUOffloadPolicy(pin_memory=True)
+                cpu_offload = CPUOffloadPolicy(pin_memory=True) if fsdp_config.param_offload else None
 
             fsdp_kwargs = {
                 "mesh": fsdp_mesh,
