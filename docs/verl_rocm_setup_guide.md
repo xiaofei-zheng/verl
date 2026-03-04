@@ -333,13 +333,15 @@ PYTHONUNBUFFERED=1 HYDRA_FULL_ERROR=1 python3 -m verl.trainer.main_ppo \
 
 ### 最终训练成果
 
-| 指标 | 值 |
-|------|-----|
-| 总训练时间 | 31 分 30 秒（58 步，2 epochs） |
-| 平均步时间 | ~28-29s/step（与单节点一致） |
-| 吞吐量 | ~1600 tok/s |
-| GSM8K 验证准确率 | 5.7% → 14.9%（提升 2.6 倍） |
-| Checkpoint | `/shared_nfs/xiaofei/verl_checkpoints_multinode/` |
+| 指标 | FSDP2 | FSDP1 |
+|------|-------|-------|
+| 总训练时间 | 31 分 51 秒（58 步，2 epochs） | 29 分 11 秒 |
+| 平均步时间 | ~31s/step | ~28s/step |
+| 吞吐量 | ~1,490 tok/s | ~1,665 tok/s |
+| GSM8K 验证准确率 | 5.76% → **65.66%** | 6.37% → **63.08%** |
+| 显存占用（allocated/reserved） | 25.1GB / 34.6GB | 25.3GB / 41.6GB |
+
+> 注：ref 模型已关闭 `param_offload` 和 `reshard_after_forward`，详见问题 5。
 
 ### 遇到的问题与解决方案
 
@@ -425,7 +427,68 @@ export NCCL_IB_GID_INDEX=1
 
 **教训**：不要盲目使用官方文档的 GID index，必须检查实际硬件的 GID 表。AINIC 与 Mellanox IB 卡的 GID 表结构不同。
 
-#### 问题 5：`ray status` 显示 GPU 使用率低
+#### 问题 5：FSDP2 多节点 ref 模型计算极慢（538-1008s vs 正常 1.3s）
+
+**现象**：多节点 FSDP2 训练中，`timing_s/ref`（reference model 前向推理）耗时 538-1008 秒，而同配置 FSDP1 仅需 2-69 秒，单节点 FSDP2 也只需几秒。
+
+**原因**：`verl/workers/fsdp_workers.py` 中，ref 模型在 FSDP2 下的 `CPUOffloadPolicy` 和 `reshard_after_forward=True` 是**硬编码**的，不受配置控制：
+
+```python
+# FSDP2 路径（原始代码 L614-615）
+cpu_offload = None if role == "actor" else CPUOffloadPolicy(pin_memory=True)
+
+# FSDP1 路径（原始代码 L589）
+cpu_offload = None if role == "actor" else CPUOffload(offload_params=True)
+```
+
+ref 模型是 eval-only（只做前向推理），开启 offload+reshard 导致每个 micro-batch forward 都要：
+1. 跨节点 all-gather 参数（RDMA ~40 GB/s，远慢于节点内 xGMI ~800 GB/s）
+2. 前向后 reshard 回分片状态
+3. 下一个 micro-batch 再次 all-gather
+
+这在单节点内可接受（xGMI 快），但多节点下成为严重瓶颈。
+
+**解决方案**：
+
+1. **修改源码** `verl/workers/fsdp_workers.py`，让 ref 的 offload 受配置控制：
+
+```python
+# FSDP2 路径修复（替换 L610-615）
+if role == "actor" and fsdp_config.offload_policy:
+    cpu_offload = CPUOffloadPolicy(pin_memory=True)
+    self._is_offload_param = False
+    self._is_offload_optimizer = False
+elif role == "actor":
+    cpu_offload = None
+else:
+    cpu_offload = CPUOffloadPolicy(pin_memory=True) if fsdp_config.param_offload else None
+
+# FSDP1 路径修复（替换 L589）
+if role == "actor":
+    cpu_offload = None
+else:
+    cpu_offload = CPUOffload(offload_params=True) if fsdp_config.param_offload else None
+```
+
+2. **训练配置**中关闭 ref 的 offload 和 reshard：
+
+```bash
+actor_rollout_ref.ref.fsdp_config.param_offload=False
+actor_rollout_ref.ref.fsdp_config.reshard_after_forward=False
+```
+
+**性能对比**：
+
+| 配置 | timing_s/ref | timing_s/step | throughput |
+|------|-------------|---------------|------------|
+| FSDP2 + ref offload+reshard（原始） | 538-1008s | ~1050s | ~47 tok/s |
+| FSDP1（对照） | 2-69s | 29-96s | 488-1,423 tok/s |
+| **FSDP2 关闭 ref offload+reshard** | **~1.3s** | **~31s** | **~1,490 tok/s** |
+| **FSDP1 关闭 ref offload+reshard** | **~1.3s** | **~28s** | **~1,665 tok/s** |
+
+**适用条件**：关闭 ref offload+reshard 后，ref 参数常驻 GPU。对 Qwen3-8B 在 16 卡上，每卡额外占用约 1GB bf16 参数，显存安全（25.1GB/192GB）。对于更大模型（如 70B），需评估显存是否足够。
+
+#### 问题 6：`ray status` 显示 GPU 使用率低
 
 **现象**：`rocm-smi` 显示 100% GPU 利用率，但 `ray status` 仅显示 5.33/16 GPU。
 
@@ -541,7 +604,8 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.free_cache_engine=True \
     actor_rollout_ref.rollout.n=5 \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=8 \
-    actor_rollout_ref.ref.fsdp_config.param_offload=True \
+    actor_rollout_ref.ref.fsdp_config.param_offload=False \
+    actor_rollout_ref.ref.fsdp_config.reshard_after_forward=False \
     actor_rollout_ref.ref.fsdp_config.model_dtype=bf16 \
     algorithm.use_kl_in_reward=False \
     trainer.critic_warmup=0 \
@@ -572,13 +636,14 @@ python3 -m verl.trainer.main_ppo \
 
 ### 多节点 vs 单节点性能对比
 
-| 指标 | 单节点 (8 GPU) | 多节点无 AINIC (16 GPU) | 多节点有 AINIC (16 GPU) |
-|------|---------------|------------------------|------------------------|
-| 步时间 | ~29s | ~270s | ~29s |
-| 吞吐量 | ~1630 tok/s | ~180 tok/s | ~1600 tok/s |
-| 加速比 | 1.0x | 0.1x | 1.0x |
+| 指标 | 单节点 (8 GPU) | 多节点无 AINIC (16 GPU) | 多节点有 AINIC + ref offload (16 GPU) | 多节点有 AINIC + 关闭 ref offload (16 GPU) |
+|------|---------------|------------------------|--------------------------------------|------------------------------------------|
+| 步时间 | ~29s | ~270s | ~1050s | **~28-31s** |
+| 吞吐量 | ~1630 tok/s | ~180 tok/s | ~47 tok/s | **~1,490-1,665 tok/s** |
+| timing_s/ref | ~2s | — | 538-1008s | **~1.3s** |
+| 加速比 | 1.0x | 0.1x | 0.03x | **~1.0x** |
 
-AINIC 带来了 **9 倍** 的性能提升，使多节点性能与单节点持平。
+关闭 ref 的 offload+reshard 后，多节点性能与单节点持平。AINIC RDMA 确保了跨节点通信带宽（~40 GB/s），但必须避免 ref 模型在 eval mode 下反复跨节点 all-gather。
 
 ### 代码修改清单
 
@@ -586,4 +651,26 @@ AINIC 带来了 **9 倍** 的性能提升，使多节点性能与单节点持平
 |------|------|---------|
 | `async_sglang_server.py` | `_is_rocm()` + `enable_memory_saver: False` + aiter backend | 单节点 + 多节点 |
 | `async_sglang_server.py` | `os.environ.get()` fallback（或设置 `CUDA_VISIBLE_DEVICES`） | 多节点 |
+| `fsdp_workers.py` | ref 模型 CPU offload 受 `fsdp_config.param_offload` 控制（FSDP1 + FSDP2） | 多节点（单节点影响小） |
+
+### 多节点训练脚本
+
+推荐使用 `rl-scripts/` 目录下的脚本：
+
+| 脚本 | 策略 | 说明 |
+|------|------|------|
+| `rl-scripts/run_multinode_grpo_fsdp2_no_reshard_offload.sh` | FSDP2 | 关闭 ref offload+reshard，已验证 |
+| `rl-scripts/run_multinode_grpo_fsdp1.sh` | FSDP1 | 关闭 ref offload+reshard，已验证 |
+
+### param_offload 与 reshard_after_forward 使用建议
+
+这两个参数对 **actor 模型**（有梯度更新）仍然推荐开启，因为 actor 需要在训练和 rollout 之间切换，offload 可以为 sglang 腾出显存。
+
+对 **ref 模型**（eval-only），是否开启取决于显存约束：
+
+| 场景 | ref offload | ref reshard | 说明 |
+|------|-------------|-------------|------|
+| 显存充足（如 8B 模型在 MI355X 192GB） | False | False | 推荐，性能最优 |
+| 显存紧张（如 70B+ 模型或小显存卡） | True | True | 牺牲性能换显存 |
+| 单节点 | 影响小 | 影响小 | 节点内 xGMI 带宽高，offload+reshard 开销可接受 |
 

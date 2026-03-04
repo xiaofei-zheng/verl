@@ -29,7 +29,7 @@ export HYDRA_FULL_ERROR=1
 
 NNODES=${NNODES:-2}
 GPUS_PER_NODE=${GPUS_PER_NODE:-8}
-SAVE_DIR=${SAVE_DIR:-/shared_nfs/xiaofei/verl_checkpoints_fsdp2_no_reshard_offload}
+SAVE_DIR=${SAVE_DIR:-/shared_nfs/xiaofei/verl_checkpoints_fsdp1_multinode}
 
 # Linear Scaling Rule: lr = base_lr * NNODES
 LR=$(python3 -c "print(1e-6 * $NNODES)")
@@ -54,7 +54,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.kl_loss_coef=0.001 \
     actor_rollout_ref.actor.kl_loss_type=low_var_kl \
     actor_rollout_ref.actor.entropy_coeff=0 \
-    actor_rollout_ref.actor.strategy=fsdp2 \
+    actor_rollout_ref.actor.strategy=fsdp \
     actor_rollout_ref.actor.fsdp_config.model_dtype=bf16 \
     actor_rollout_ref.actor.fsdp_config.param_offload=True \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=True \
@@ -74,7 +74,7 @@ python3 -m verl.trainer.main_ppo \
     trainer.critic_warmup=0 \
     trainer.logger=console \
     trainer.project_name=verl_grpo_qwen3_8b_multinode \
-    trainer.experiment_name=qwen3_8b_grpo_fsdp2_no_reshard_offload_${NNODES}node \
+    trainer.experiment_name=qwen3_8b_grpo_fsdp1_${NNODES}node \
     trainer.n_gpus_per_node=$GPUS_PER_NODE \
     trainer.nnodes=$NNODES \
     trainer.save_freq=50 \
