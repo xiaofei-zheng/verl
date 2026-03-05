@@ -77,7 +77,7 @@ python3 -m verl.trainer.main_ppo \
     trainer.experiment_name=qwen3_8b_grpo_fsdp1_${NNODES}node \
     trainer.n_gpus_per_node=$GPUS_PER_NODE \
     trainer.nnodes=$NNODES \
-    trainer.save_freq=50 \
+    trainer.save_freq=100 \
     trainer.default_local_dir=$SAVE_DIR \
     trainer.test_freq=5 \
     trainer.total_epochs=2

@@ -23,7 +23,7 @@ export RCCL_MSCCL_ENABLE=0
 export NCCL_DEBUG=INFO
 export TOKENIZERS_PARALLELISM=false
 export HSA_NO_SCRATCH_RECLAIM=1
-export LD_LIBRARY_PATH=/usr/lib:${LD_LIBRARY_PATH:-}
+# export LD_LIBRARY_PATH=/usr/lib:${LD_LIBRARY_PATH:-}
 export PYTHONUNBUFFERED=1
 export HYDRA_FULL_ERROR=1
 
@@ -77,7 +77,7 @@ python3 -m verl.trainer.main_ppo \
     trainer.experiment_name=qwen3_8b_grpo_fsdp2_no_reshard_offload_${NNODES}node \
     trainer.n_gpus_per_node=$GPUS_PER_NODE \
     trainer.nnodes=$NNODES \
-    trainer.save_freq=50 \
+    trainer.save_freq=100 \
     trainer.default_local_dir=$SAVE_DIR \
     trainer.test_freq=5 \
     trainer.total_epochs=2
