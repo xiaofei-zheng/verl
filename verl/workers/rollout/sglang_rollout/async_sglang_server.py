@@ -89,6 +89,16 @@ class SGLangHttpServer:
         print(f"SGLang http server: {rollout_mode=}, {replica_rank=}, {node_rank=}, {nnodes=}, {cuda_visible_devices=}")
         os.environ[visible_devices_keyword] = cuda_visible_devices
 
+        if _is_rocm():
+            _rocm_defaults = {
+                "SGLANG_USE_AITER": "0",
+                "NVTE_FUSED_ATTN_CK": "0",
+                "PYTORCH_HIP_ALLOC_CONF": "expandable_segments:True",
+            }
+            for k, v in _rocm_defaults.items():
+                os.environ.setdefault(k, v)
+            print(f"SGLang http server: applied ROCm env defaults on {node_rank=}")
+
         self.config: RolloutConfig = omega_conf_to_dataclass(config)
         self.model_config: HFModelConfig = omega_conf_to_dataclass(model_config, dataclass_type=HFModelConfig)
         max_position_embeddings = get_max_position_embeddings(self.model_config.hf_config)
@@ -153,6 +163,11 @@ class SGLangHttpServer:
             assert master_address and master_port, "non-master node should provide master address and port"
             self._master_address = master_address
             self._master_port = master_port
+
+        import torch
+        for gpu_idx in range(torch.cuda.device_count()):
+            free, total = torch.cuda.mem_get_info(gpu_idx)
+            print(f"[DIAG] GPU {gpu_idx}: free={free/1024**3:.2f} GiB, total={total/1024**3:.2f} GiB, used={(total-free)/1024**3:.2f} GiB")
 
         engine_kwargs = self.config.get("engine_kwargs", {}).get("sglang", {}) or {}
         attention_backend = engine_kwargs.pop("attention_backend", None)
@@ -466,12 +481,17 @@ class SGLangReplica(RolloutReplica):
         )
         worker_cuda_visible_devices = [worker_info[1] for worker_info in worker_infos]
         worker_node_ids = [worker_info[0] for worker_info in worker_infos]
-        base_gpu_id = 0
         infer_tp = self.config.tensor_model_parallel_size * self.config.data_parallel_size
         replica_world_size = infer_tp * self.config.pipeline_model_parallel_size
-        if os.environ.get(f"RAY_EXPERIMENTAL_NOSET_{visible_devices_keyword}", None):
-            logger.warning(f"RAY_EXPERIMENTAL_NOSET_{visible_devices_keyword} is set True!")
-            base_gpu_id = (0 + self.replica_rank * replica_world_size) % self.gpus_per_node
+        # Always compute base_gpu_id from replica_rank because we set
+        # RAY_EXPERIMENTAL_NOSET on the SGLangHttpServer actors (via runtime_env),
+        # and os.environ here (inside the TaskRunner actor) does NOT inherit the
+        # driver's exports, so the env-var check is unreliable.
+        base_gpu_id = (self.replica_rank * replica_world_size) % self.gpus_per_node
+        logger.warning(
+            f"SGLang base_gpu_id={base_gpu_id} for replica_rank={self.replica_rank}, "
+            f"replica_world_size={replica_world_size}, gpus_per_node={self.gpus_per_node}"
+        )
         # create server actor in each node with node affinity and cuda visible devices
         for node_rank in range(self.nnodes):
             workers = self.workers[

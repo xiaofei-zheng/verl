@@ -80,4 +80,5 @@ python3 -m verl.trainer.main_ppo \
     trainer.save_freq=100 \
     trainer.default_local_dir=$SAVE_DIR \
     trainer.test_freq=5 \
-    trainer.total_epochs=2
+    trainer.total_epochs=2 \
+    2>&1 | tee /shared_nfs/xiaofei/verl/grpo_fsdp2_no_reshard_offload_${NNODES}node.log

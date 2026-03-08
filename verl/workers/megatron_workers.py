@@ -666,6 +666,12 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
                 peft_cls=self.peft_cls,
             )
 
+            # Force dist checkpoint format for saving to avoid cross-node
+            # all_gather in mbridge HF save path (EP group spans nodes).
+            if not self.checkpoint_mananager.use_dist_checkpointing:
+                self.checkpoint_mananager.use_dist_checkpointing = True
+                self.checkpoint_mananager.use_hf_checkpoint = False
+
             self.layer_name_mapping = {
                 "qkv_layer_name": "self_attention.linear_qkv.",
                 "gate_proj_layer_name": "linear_fc1.",
