@@ -1,4 +1,6 @@
 #!/bin/bash
+# Qwen3-30B-A3B GRPO RL — 2-node Megatron + sglang
+# 详细问题排查记录见: rl-docs/megatron_sglang_rocm_guide.md
 set -e
 
 cd /shared_nfs/xiaofei/verl

@@ -265,7 +265,59 @@ ppo_mini_batch_size <= train_batch_size
   - sglang HTTP server 在 `ep_poll`（等待事件）
   - 无新错误日志
 - **原因**：sglang scheduler 进入死循环或死锁（疑似 ROCm GPU 内存/通信问题）
-- **状态**：待进一步排查，需要 kill 后重跑观察复现性
+- **状态**：多节点 2-node 训练中未复现
+
+### 问题 12：Checkpoint 保存路径必须是 NFS 绝对路径（多节点）
+
+- **现象**：checkpoint 保存后 HEAD 节点崩溃 (`Owner's node has crashed`)
+- **原因**：`trainer.default_local_dir` 默认是相对路径，RayJob 工作目录是 `/sgl-workspace/`，checkpoint 写到了本地盘（无存储空间），磁盘写满导致节点崩溃
+- **解决**：设置 `trainer.default_local_dir` 为 NFS 绝对路径，如 `/shared_nfs/xiaofei/verl/checkpoints/...`
+
+### 问题 13：ROCm/HIP 7.0 fork 导致 checkpoint 保存 SIGSEGV（多节点）
+
+- **现象**：checkpoint 保存时 `SIGSEGV received`，崩溃在 `crc32_16bytes()` → `torch.serialization._save`
+- **调用链**：`write_preloaded_data_multiproc` → `Process.start()` (fork) → 子进程 `_write_item` → SIGSEGV
+- **原因**：HIP 7.0 在 GPU 上下文初始化后 fork 子进程，子进程继承损坏的 HIP 内存映射
+- **解决**：`verl/utils/megatron/dist_checkpointing.py` 中用 `threading.Thread` 替换 `multiprocessing.fork`，通过 `_patch_filesystem_writer_for_rocm()` 在每次 save 前自动应用
+- **补丁内容**：
+  - `_preload_no_pinned`：强制 `non_blocking=False`，避免 pinned memory 问题
+  - `_write_threaded`：用线程并行写入替代 fork，保持 I/O 并行性能
+
+### 问题 14：多节点 EP 场景必须强制使用 dist_checkpointing 格式
+
+- **现象**：HF 格式保存时 hang 或崩溃
+- **原因**：Megatron-Bridge 的 HF save 路径需要 `all_gather` 把分布在不同 EP rank 的 expert 权重聚合，跨节点的 `all_gather` 触发通信超时/崩溃
+- **解决**：`megatron_workers.py` 中 force `use_dist_checkpointing=True, use_hf_checkpoint=False`
+- **关于 dist_ckpt 格式**：基于 PyTorch Distributed Checkpoint，存储带 sharding 元信息的张量，支持并行度弹性（EP=8 保存 → EP=4 加载，自动重分片）
+
+### 问题 15：__pycache__ 导致代码修改不生效（多节点）
+
+- **现象**：修改了 `dist_checkpointing.py` 的补丁代码，但 RayJob 仍然使用旧逻辑（fork 方式）
+- **原因**：RayJob 的 worker 节点从 NFS 加载了 `.pyc` 缓存文件，未重新编译 `.py`
+- **解决**：训练脚本开头清理 `__pycache__`：
+  ```bash
+  find /shared_nfs/xiaofei/verl/verl/utils/megatron -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
+  ```
+
+### 问题 16：total_training_steps=-1 不兼容 Megatron lr_scheduler
+
+- **现象**：`AssertionError: assert self.lr_decay_steps > 0`
+- **原因**：`total_training_steps=-1` 表示无限训练，但 Megatron 的 `OptimizerParamScheduler` 需要具体的 decay 步数
+- **解决**：不设置 `total_training_steps`，让 verl 根据 `total_epochs` 和数据量自动计算
+
+### 问题 17：dist_ckpt → HuggingFace 格式转换
+
+- **现象**：训练后的 checkpoint 无法直接用 sglang 推理
+- **原因**：verl 没有内置的 dist_ckpt → HF 单机转换工具，`legacy_model_merger.py` 只支持旧格式
+- **解决**：编写自定义转换脚本 `scripts/converter_mcore_to_hf.py`
+  ```bash
+  torchrun --nproc_per_node=8 scripts/converter_mcore_to_hf.py \
+      --ckpt_dir .../global_step_N/actor \
+      --hf_model_path /shared_nfs/xiaofei/models/Qwen3-30B-A3B \
+      --output_dir /shared_nfs/xiaofei/models/Qwen3-30B-A3B-RL \
+      --ep_size 8
+  ```
+  脚本工作流程：初始化 Megatron (EP=8) → CPU 创建模型 → 加载 dist_ckpt → 提取 HF 格式权重 → 各 rank 将 expert 权重写入 NFS 临时文件 → rank 0 合并保存为 safetensors
 
 ---
 
@@ -282,7 +334,7 @@ ppo_mini_batch_size <= train_batch_size
 | GPU 显存 | 76.7 GB allocated / 78.6 GB reserved |
 | 主要瓶颈 | weight sync ~2.6s（~50% step time） |
 
-### 6.2 Qwen3-30B-A3B Megatron + sglang（32 步后 hang）
+### 6.2 Qwen3-30B-A3B Megatron + sglang 单节点（32 步后 hang）
 
 | 指标 | 值 |
 |------|------|
@@ -294,7 +346,7 @@ ppo_mini_batch_size <= train_batch_size
 | GPU 显存 | 73.6 GB allocated / 84.3 GB reserved |
 | CPU 内存 | ~869 GB |
 
-step time 分解（30B）：
+step time 分解（30B 单节点）：
 
 | 阶段 | 时间 | 占比 |
 |------|------|------|
@@ -304,12 +356,51 @@ step time 分解（30B）：
 | old_log_prob | ~8s | 12% |
 | ref | ~6s | 9% |
 
+### 6.3 Qwen3-30B-A3B Megatron + sglang 2节点（已完成，成功）
+
+| 指标 | 值 |
+|------|------|
+| 节点数 | 2 (16 GPU) |
+| 并行策略 | 训练 TP=1,EP=8,PP=1,DP=2; Rollout TP=4,DP=2 |
+| 训练步数 | 116 步，完成 1 epoch |
+| 初始 GSM8K Acc | **43.8%** |
+| 最终 GSM8K Score | **~80%** |
+| 平均 step time | ~58s |
+| 平均吞吐量 | ~430-500 tok/s |
+| GPU 显存 | 94 GB allocated / 108 GB reserved (per GPU) |
+| CPU 内存 | ~274 GB (per node) |
+| 总训练时间 | 2h42m |
+| Checkpoint 保存 | ✅ 线程写入，耗时 ~281s/次 |
+
+step time 分解（30B 2节点）：
+
+| 阶段 | 时间 | 占比 |
+|------|------|------|
+| gen（sglang rollout） | ~15s | 26% |
+| update_weights（权重同步） | ~20s | 34% |
+| update_actor（训练） | ~14s | 24% |
+| old_log_prob | ~4s | 7% |
+| ref | ~4s | 7% |
+
+训练后的 HF 模型保存在 `/shared_nfs/xiaofei/models/Qwen3-30B-A3B-RL`，
+由 `scripts/converter_mcore_to_hf.py` 从 dist_ckpt 转换而来。
+
+**推理评测（GSM8K 前 100 题，sglang TP=4，temperature=0.6）**：
+
+| 模型 | 正确率 |
+|------|--------|
+| Base (Qwen3-30B-A3B) | 87/100 (87%) |
+| RL 训练后 | 96/100 (**96%**) |
+| **提升** | **+9 个百分点** |
+
+9 道分歧题 RL 全部答对，Base 全部答错。RL 训练不仅提升了推理能力，还改善了输出格式规范性（如 `75.00` → `75`）。
+
 ---
 
 ## 7. 已知问题与待解决项
 
-1. **30B 训练 hang 问题**：step 32 后 sglang scheduler 死锁，需要排查是否可复现以及具体触发条件
-2. **EP/TP 优化**：当前 EP=8/TP=1，可以尝试降低 EP 提高 TP 来减少 expert 重分片开销
-3. **外部开发者 patch**：参考 verl MoE Megatron 适配代码，可能有更好的权重同步方案
-4. **ref 模型 offload 优化**：当前 `ref.megatron.param_offload=True`，关闭后预计可节省 3-4s/step（~5%）
-5. **async 训练**：verl 支持 sglang async rollout，可能提升整体 pipeline 效率
+1. **EP/TP 优化**：当前 EP=8/TP=1，Megatron 和 sglang 的模型切法不同（EP vs TP），update_weights 需要复杂的 expert 重映射（~20s/step，占 34%）。降低 EP 提高 TP 可能减少重分片开销
+2. **Checkpoint 保存性能**：线程写入 ~281s/次，优化方向包括只保存 model 权重（跳过 optimizer）、减少保存频率
+3. **async 训练**：verl 支持 sglang async rollout，可能提升整体 pipeline 效率
+4. **ref 模型 offload**：关闭 `ref.megatron.param_offload` 可节省 ~3-4s/step
+5. **dist_ckpt → HF 转换**：verl 缺少内置工具，当前使用自定义脚本 `scripts/converter_mcore_to_hf.py`，建议后续训练在 `save_contents` 中加入 `hf_model` 自动导出
