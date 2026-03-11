@@ -1,0 +1,46 @@
+# verl FSDP2 + sglang rollout on ROCm 7.0 / MI355X
+# Base: sglang official ROCm image (includes sglang, aiter, PyTorch, ROCm 7.0)
+#
+# Build (context = aiter_jit_cache dir for COPY, --network=host for DNS):
+#   docker build --network=host -f rl-docs/Dockerfile.fsdp.rocm700.mi35x \
+#       -t verl-fsdp-rocm700:latest /shared_nfs/xiaofei/aiter_jit_cache
+#
+# Key verl code changes included in the fork:
+#   - async_sglang_server.py: ROCm detection, aiter attention backend, memory_saver=False
+#   - constants_ppo.py: NCCL/RCCL env var propagation to Ray workers
+#   - fsdp_workers.py: ref model CPU offload controlled by fsdp_config.param_offload
+
+FROM lmsysorg/sglang:v0.5.6.post1-rocm700-mi35x
+
+SHELL ["/bin/bash", "-cexo", "pipefail"]
+
+# ── Bake aiter JIT compiled kernels (skip 10-15 min first-time compilation) ──
+COPY *.so /sgl-workspace/aiter/aiter/jit/
+COPY build/ /sgl-workspace/aiter/aiter/jit/build/
+RUN find /sgl-workspace/aiter/aiter/jit/build -name "lock*" -exec rm -f {} \; 2>/dev/null || true
+
+# ── Install Ray (pinned to match cluster version) ──
+ARG RAY_VERSION=2.44.1
+RUN pip install --no-cache-dir "ray[default]==${RAY_VERSION}"
+
+# ── Clone and install verl from fork ──
+ARG VERL_REPO=https://github.com/xiaofei-zheng/verl.git
+ARG VERL_BRANCH=feature/xiaofei/sglang-fsdp2
+WORKDIR /workspace
+RUN git config --global http.postBuffer 524288000 && \
+    git clone --depth 1 --branch ${VERL_BRANCH} ${VERL_REPO} verl && \
+    cd verl && \
+    pip install --no-cache-dir -e .
+
+# ── ROCm essentials (always required for correct operation) ──
+ENV SGLANG_DISABLE_FA3=1
+ENV TOKENIZERS_PARALLELISM=false
+ENV PYTHONUNBUFFERED=1
+
+# NCCL/RCCL tuning vars (NCCL_MIN_NCHANNELS, NCCL_PROTO, GPU_MAX_HW_QUEUES,
+# HIP_VISIBLE_DEVICES, HSA_NO_SCRATCH_RECLAIM, etc.) are cluster-specific
+# and should be set at runtime via training scripts or docker run --env.
+# constants_ppo.py will auto-propagate them from the head node to Ray workers.
+
+WORKDIR /workspace/verl
+CMD ["/bin/bash"]

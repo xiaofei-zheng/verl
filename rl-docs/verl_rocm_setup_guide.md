@@ -2,6 +2,35 @@
 
 基于 sglang 初始镜像，配置 verl + FSDP + SGLang rollout 在 MI355X 上运行 GRPO 训练的完整步骤。
 
+## Docker 镜像（推荐）
+
+已提供预构建 Dockerfile，包含所有依赖和 ROCm 适配补丁，可跳过下面的手动步骤：
+
+```bash
+# 构建镜像（在 verl 仓库根目录执行）
+docker build -f rl-docs/Dockerfile.fsdp.rocm700.mi35x -t verl-fsdp-rocm700:latest .
+
+# 运行容器（挂载 NFS 和 GPU）
+docker run --rm -it --device=/dev/kfd --device=/dev/dri \
+    --group-add video --group-add render \
+    -v /shared_nfs:/shared_nfs \
+    verl-fsdp-rocm700:latest
+```
+
+基础镜像: `lmsysorg/sglang:v0.5.6.post1-rocm700-mi35x`
+
+Dockerfile 位于 `rl-docs/Dockerfile.fsdp.rocm700.mi35x`，主要内容：
+- 清理 aiter JIT 锁文件
+- 安装 Ray 2.44.1
+- 从 fork 仓库克隆 verl 并安装（包含所有 ROCm 适配代码修改）
+- 设置 ROCm / NCCL / RCCL 环境变量
+
+如果使用 Docker 镜像，可直接跳到[第五步：设置环境变量](#第五步设置环境变量)（环境变量已在镜像中设置，但多节点 AINIC 相关参数可能需要覆盖）。
+
+---
+
+以下是手动配置步骤（不使用 Docker 镜像时参考）：
+
 ## 前提条件
 
 - 镜像：sglang ROCm 镜像（已包含 sglang、torch、ROCm 等）
@@ -652,6 +681,29 @@ python3 -m verl.trainer.main_ppo \
 | `async_sglang_server.py` | `_is_rocm()` + `enable_memory_saver: False` + aiter backend | 单节点 + 多节点 |
 | `async_sglang_server.py` | `os.environ.get()` fallback（或设置 `CUDA_VISIBLE_DEVICES`） | 多节点 |
 | `fsdp_workers.py` | ref 模型 CPU offload 受 `fsdp_config.param_offload` 控制（FSDP1 + FSDP2） | 多节点（单节点影响小） |
+| `constants_ppo.py` | NCCL/RCCL 环境变量自动传播到 Ray workers（见下方说明） | 多节点 |
+
+#### constants_ppo.py：NCCL/RCCL 环境变量传播
+
+**文件**: `verl/trainer/constants_ppo.py`
+
+**问题**：多节点训练时，head 节点上设置的 NCCL/RCCL 优化环境变量（如 `NCCL_MIN_NCHANNELS`、`RCCL_MSCCL_ENABLE`、`HSA_NO_SCRATCH_RECLAIM` 等）不会自动传播到 Ray worker 进程，导致跨节点通信配置不一致，可能引发 RCCL 初始化 hang 或性能退化。
+
+**解决方案**：在 `get_ppo_ray_runtime_env()` 中自动扫描当前环境中以特定前缀开头的变量，注入到 Ray `runtime_env.env_vars`：
+
+```python
+_NCCL_RCCL_PROPAGATE_PREFIXES = (
+    "NCCL_", "RCCL_", "NCCL_NET_PLUGIN_PATH",
+    "LD_LIBRARY_PATH", "HSA_NO_SCRATCH_RECLAIM",
+    "GPU_MAX_HW_QUEUES", "TORCH_NCCL_HIGH_PRIORITY",
+    "PYTORCH_HIP_ALLOC_CONF", "HIP_VISIBLE_DEVICES",
+)
+
+# 在 get_ppo_ray_runtime_env() 中添加：
+for key, val in os.environ.items():
+    if any(key.startswith(p) or key == p for p in _NCCL_RCCL_PROPAGATE_PREFIXES):
+        runtime_env["env_vars"][key] = val
+```
 
 ### 多节点训练脚本
 
