@@ -294,6 +294,28 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
                     nccl_communicator_config_path=None,
                 )
 
+            # Create rollout device mesh while all workers are still synchronized
+            # (before model loading which causes time divergence across workers).
+            # init_device_mesh is collective — all workers must call new_group()
+            # together. Placing it here avoids Gloo TCP rendezvous timeouts that
+            # occur when workers diverge during large model NFS loading.
+            if self._is_rollout:
+                from torch.distributed.device_mesh import init_device_mesh
+
+                infer_tp = self.config.rollout.tensor_model_parallel_size * self.config.rollout.data_parallel_size
+                infer_pp = self.config.rollout.pipeline_model_parallel_size
+                infer_world_size = infer_tp * infer_pp
+                world_size = torch.distributed.get_world_size()
+                dp = world_size // infer_world_size
+                assert world_size % infer_world_size == 0, (
+                    f"rollout world_size: {world_size} is not divisible by infer_world_size: {infer_world_size}"
+                )
+                self._rollout_device_mesh = init_device_mesh(
+                    get_device_name(),
+                    mesh_shape=(dp, infer_tp, infer_pp),
+                    mesh_dim_names=["dp", "infer_tp", "infer_pp"],
+                )
+
         if self._is_actor or self._is_ref:
             is_collect = (
                 mpu.get_tensor_model_parallel_rank() == 0
@@ -507,24 +529,13 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         return actor_module, actor_optimizer, actor_optimizer_scheduler, self.hf_config, optim_config
 
     def _build_rollout(self, trust_remote_code=False):
-        from torch.distributed.device_mesh import init_device_mesh
-
         # 1. parse rollout and huggingface model config
         rollout_config: RolloutConfig = omega_conf_to_dataclass(self.config.rollout)
         model_config: HFModelConfig = omega_conf_to_dataclass(self.config.model)
 
-        # 2. build rollout device mesh
-        infer_tp = self.config.rollout.tensor_model_parallel_size * self.config.rollout.data_parallel_size
-        infer_pp = self.config.rollout.pipeline_model_parallel_size
-        infer_world_size = infer_tp * infer_pp
-        dp = self.world_size // infer_world_size
-        assert self.world_size % infer_world_size == 0, (
-            f"rollout world_size: {self.world_size} is not divisible by infer_world_size: {infer_world_size}"
-        )
-        rollout_device_mesh = init_device_mesh(
-            get_device_name(), mesh_shape=(dp, infer_tp, infer_pp), mesh_dim_names=["dp", "infer_tp", "infer_pp"]
-        )
-
+        # 2. use rollout device mesh created in __init__ (while workers were
+        #    still synchronized, before model loading caused time divergence)
+        rollout_device_mesh = self._rollout_device_mesh
         self.rollout_device_mesh = rollout_device_mesh
 
         is_collect = (
