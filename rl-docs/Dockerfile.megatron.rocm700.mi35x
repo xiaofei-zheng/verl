@@ -1,0 +1,103 @@
+# verl Megatron-Core + sglang rollout on ROCm 7.0 / MI355X
+# Base: sglang official ROCm image (includes sglang, aiter, PyTorch, ROCm 7.0)
+#
+# Build (context = megatron_docker_wheels dir, --network=host for DNS):
+#   docker build --network=host -f rl-docs/Dockerfile.megatron.rocm700.mi35x \
+#       -t verl-megatron-rocm700:latest /shared_nfs/xiaofei/megatron_docker_wheels
+#
+# Key verl code changes included in the fork:
+#   - async_sglang_server.py: ROCm detection, aiter attention backend, memory_saver=False
+#   - constants_ppo.py: NCCL/RCCL env var propagation to Ray workers
+#   - megatron_workers.py: init_device_mesh moved to __init__ (fix multi-node Gloo timeout)
+#   - dist_checkpointing.py: thread-based checkpoint saving (fix HIP fork SIGSEGV)
+#   - rollout.yaml + sglang_rollout.py: server timeout/retry config support
+
+FROM lmsysorg/sglang:v0.5.6.post1-rocm700-mi35x
+
+SHELL ["/bin/bash", "-cexo", "pipefail"]
+
+# ── Bake aiter JIT compiled kernels (skip 10-15 min first-time compilation) ──
+COPY *.so /sgl-workspace/aiter/aiter/jit/
+COPY build/ /sgl-workspace/aiter/aiter/jit/build/
+RUN find /sgl-workspace/aiter/aiter/jit/build -name "lock*" -exec rm -f {} \; 2>/dev/null || true
+
+# ── Install Ray (pinned to match cluster version) ──
+ARG RAY_VERSION=2.44.1
+RUN pip install --no-cache-dir "ray[default]==${RAY_VERSION}"
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TransformerEngine (ROCm) — pre-built v2.8.0.dev0+ca2965d, Python 3.10, ROCm 7.0
+# ══════════════════════════════════════════════════════════════════════════════
+ENV NVTE_FRAMEWORK=pytorch
+COPY transformer_engine/ /opt/venv/lib/python3.10/site-packages/transformer_engine/
+COPY transformer_engine-2.8.0.dev0+ca2965d.dist-info/ /opt/venv/lib/python3.10/site-packages/transformer_engine-2.8.0.dev0+ca2965d.dist-info/
+
+# --- 从源码编译 TransformerEngine（备选，约 60-90 分钟）---
+# ARG TE_COMMIT=ca2965db1651e0471e8eed1b71f1c59b35e999be
+# WORKDIR /workspace
+# RUN git config --global http.postBuffer 524288000 && \
+#     git clone https://github.com/ROCm/TransformerEngine.git && \
+#     cd TransformerEngine && \
+#     git checkout ${TE_COMMIT} && \
+#     git submodule update --init 3rdparty/aiter 3rdparty/hipify_torch 3rdparty/aotriton && \
+#     cd 3rdparty/aiter && git submodule update --init 3rdparty/composable_kernel && cd ../.. && \
+#     pip install --no-cache-dir --no-build-isolation . && \
+#     cd /workspace && rm -rf TransformerEngine
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Megatron-Core (AMD fork, pinned)
+# ══════════════════════════════════════════════════════════════════════════════
+ARG MEGATRON_REPO=https://github.com/yushengsu-thu/Megatron-LM-amd_version.git
+ARG MEGATRON_COMMIT=1b8b0882dacebc5f3529133a184b0b8f5a6b7926
+RUN git config --global http.postBuffer 524288000 && \
+    git clone ${MEGATRON_REPO} /tmp/megatron && \
+    cd /tmp/megatron && \
+    git checkout ${MEGATRON_COMMIT} && \
+    pip install --no-cache-dir -e . && \
+    rm -rf /tmp/megatron/.git
+
+# ── Install mbridge (HuggingFace <-> Megatron weight conversion) ──
+RUN pip install --no-cache-dir mbridge==0.15.1
+
+# ══════════════════════════════════════════════════════════════════════════════
+# torch_memory_saver — 不安装
+# torch_memory_saver_numa fork 的 API 与 sglang 不兼容（缺少
+# torch_memory_saver.torch_memory_saver 属性），安装后会触发 AttributeError
+# 而非 ImportError，导致 sglang 无法优雅降级。不安装时 sglang 会自动以
+# Noop adapter 运行（verl 也设 memory_saver=False）。
+# ══════════════════════════════════════════════════════════════════════════════
+# --- 预编译 COPY 方式（与 sglang v0.5.6 不兼容，暂禁用）---
+# COPY torch_memory_saver/ /opt/venv/lib/python3.10/site-packages/torch_memory_saver/
+# COPY torch_memory_saver-0.0.5.dist-info/ /opt/venv/lib/python3.10/site-packages/torch_memory_saver-0.0.5.dist-info/
+# COPY torch_memory_saver_cpp.cpython-310-x86_64-linux-gnu.so /opt/venv/lib/python3.10/site-packages/
+
+# --- 从源码编译 torch_memory_saver（备选，同样与 sglang 不兼容）---
+# RUN git clone https://github.com/zhuohan123/torch_memory_saver_numa /tmp/tms && \
+#     cd /tmp/tms && \
+#     sed -i '1i #include <cassert>' csrc/torch_memory_saver_hip.cpp && \
+#     pip install --no-cache-dir . && \
+#     rm -rf /tmp/tms
+
+# ── Clone and install verl from fork ──
+ARG VERL_REPO=https://github.com/xiaofei-zheng/verl.git
+ARG VERL_BRANCH=feature/xiaofei/sglang-fsdp2
+WORKDIR /workspace
+RUN git config --global http.postBuffer 524288000 && \
+    git clone --depth 1 --branch ${VERL_BRANCH} ${VERL_REPO} verl && \
+    cd verl && \
+    pip install --no-cache-dir -e .
+
+# ── ROCm / Megatron essentials (always required for correct operation) ──
+ENV SGLANG_DISABLE_FA3=1
+ENV NVTE_FUSED_ATTN_CK=0
+ENV SGLANG_USE_AITER=0
+ENV TOKENIZERS_PARALLELISM=false
+ENV PYTHONUNBUFFERED=1
+
+# NCCL/RCCL tuning vars (NCCL_MIN_NCHANNELS, NCCL_PROTO, GPU_MAX_HW_QUEUES,
+# HIP_VISIBLE_DEVICES, HSA_NO_SCRATCH_RECLAIM, etc.) are cluster-specific
+# and should be set at runtime via training scripts or docker run --env.
+# constants_ppo.py will auto-propagate them from the head node to Ray workers.
+
+WORKDIR /workspace/verl
+CMD ["/bin/bash"]

@@ -1,6 +1,35 @@
 # verl Megatron + sglang RL 训练指南（ROCm MI355X）
 
-环境：ROCm MI355X × 8 GPU，verl + Megatron-Core + sglang rollout，单节点
+环境：ROCm MI355X × 8 GPU，verl + Megatron-Core + sglang rollout，单节点 / 多节点
+
+## Docker 镜像（推荐）
+
+已提供预构建 Dockerfile，包含所有 Megatron 依赖（TransformerEngine、megatron-core、mbridge、torch_memory_saver）和 ROCm 适配补丁：
+
+```bash
+# 构建镜像（在 verl 仓库根目录执行）
+docker build -f rl-docs/Dockerfile.megatron.rocm700.mi35x -t verl-megatron-rocm700:latest .
+
+# 运行容器（挂载 NFS 和 GPU）
+docker run --rm -it --device=/dev/kfd --device=/dev/dri \
+    --group-add video --group-add render \
+    -v /shared_nfs:/shared_nfs \
+    verl-megatron-rocm700:latest
+```
+
+基础镜像: `lmsysorg/sglang:v0.5.6.post1-rocm700-mi35x`
+
+Dockerfile 位于 `rl-docs/Dockerfile.megatron.rocm700.mi35x`，主要内容：
+- 安装 TransformerEngine (ROCm)、megatron-core、mbridge、torch_memory_saver
+- 安装 Ray 2.44.1
+- 从 fork 仓库克隆 verl 并安装（包含所有 ROCm 适配代码修改）
+- 设置 ROCm / NCCL / RCCL / Megatron 环境变量
+
+如果使用 Docker 镜像，可直接跳到[训练脚本配置](#4-训练脚本配置)。
+
+---
+
+以下是手动配置步骤（不使用 Docker 镜像时参考）：
 
 ## 目录
 
@@ -131,6 +160,59 @@ server:
   retry_delay: 2.0
   max_connections: 1000
   max_start_wait_time: 300.0
+```
+
+### 3.4 NCCL/RCCL 环境变量传播到 Ray workers
+
+**文件**: `verl/trainer/constants_ppo.py`
+
+多节点训练时，head 节点上设置的 NCCL/RCCL 优化环境变量（如 `NCCL_MIN_NCHANNELS`、`RCCL_MSCCL_ENABLE`、`HSA_NO_SCRATCH_RECLAIM` 等）不会自动传播到 Ray worker 进程，导致跨节点通信配置不一致，可能引发 RCCL 初始化 hang 或性能退化。
+
+在 `get_ppo_ray_runtime_env()` 中添加自动环境变量传播逻辑：
+
+```python
+_NCCL_RCCL_PROPAGATE_PREFIXES = (
+    "NCCL_", "RCCL_", "NCCL_NET_PLUGIN_PATH",
+    "LD_LIBRARY_PATH", "HSA_NO_SCRATCH_RECLAIM",
+    "GPU_MAX_HW_QUEUES", "TORCH_NCCL_HIGH_PRIORITY",
+    "PYTORCH_HIP_ALLOC_CONF", "HIP_VISIBLE_DEVICES",
+)
+
+# 在 get_ppo_ray_runtime_env() 返回前添加：
+for key, val in os.environ.items():
+    if any(key.startswith(p) or key == p for p in _NCCL_RCCL_PROPAGATE_PREFIXES):
+        runtime_env["env_vars"][key] = val
+```
+
+### 3.5 多节点 init_device_mesh 时序修复
+
+**文件**: `verl/workers/megatron_workers.py`
+
+**问题**：多节点训练大模型（如 Qwen3-235B）时，各 worker 从 NFS 加载模型的时间差异很大（可达 30 分钟以上）。原代码中 `init_device_mesh()` 在 `_build_rollout()` 中调用（即模型加载完成后），此时先完成加载的 worker 等待后完成的 worker 加入集体操作，但 Gloo 同步后端的 TCP rendezvous 超时（默认 1800s）会被耗尽，导致 `DistStoreError`。
+
+**根因**：`init_device_mesh()` 是集体操作（所有 worker 必须同时调用 `new_group()`），但被放在了 worker 时间线已经分叉的位置。
+
+**解决方案**：将 `init_device_mesh()` 从 `_build_rollout()` 移到 `__init__()` 中 `mpu.initialize_model_parallel()` 之后、模型加载之前。此时所有 worker 仍然同步，集体操作不会超时。
+
+```python
+# 在 __init__ 中，mpu.initialize_model_parallel() 之后添加：
+if self._is_rollout:
+    from torch.distributed.device_mesh import init_device_mesh
+
+    infer_tp = self.config.rollout.tensor_model_parallel_size * self.config.rollout.data_parallel_size
+    infer_pp = self.config.rollout.pipeline_model_parallel_size
+    infer_world_size = infer_tp * infer_pp
+    world_size = torch.distributed.get_world_size()
+    dp = world_size // infer_world_size
+    self._rollout_device_mesh = init_device_mesh(
+        get_device_name(),
+        mesh_shape=(dp, infer_tp, infer_pp),
+        mesh_dim_names=["dp", "infer_tp", "infer_pp"],
+    )
+
+# 在 _build_rollout() 中改为使用已创建的 device mesh：
+rollout_device_mesh = self._rollout_device_mesh
+self.rollout_device_mesh = rollout_device_mesh
 ```
 
 ---
@@ -318,6 +400,23 @@ ppo_mini_batch_size <= train_batch_size
       --ep_size 8
   ```
   脚本工作流程：初始化 Megatron (EP=8) → CPU 创建模型 → 加载 dist_ckpt → 提取 HF 格式权重 → 各 rank 将 expert 权重写入 NFS 临时文件 → rank 0 合并保存为 safetensors
+
+### 问题 18：6 节点 235B 训练 init_device_mesh DistStoreError（多节点）
+
+- **现象**：6 节点 48 GPU 训练 Qwen3-235B 时，初始化阶段卡住 30 分钟后报 `torch.distributed.DistStoreError: wait timeout after 1800000ms`，错误发生在 `init_device_mesh` → `new_group()` 调用
+- **根因**：
+  1. 235B 模型从 NFS 加载需要很长时间（>30 分钟），各 worker 因 NFS I/O 竞争导致加载完成时间差异巨大
+  2. 原代码中 `init_device_mesh()` 在 `_build_rollout()` 中调用（模型加载完成后），此时 worker 时间线已分叉
+  3. `init_device_mesh()` 内部使用 Gloo 同步后端创建 process group，要求所有 worker 同时参与 TCP rendezvous
+  4. 先完成加载的 worker 等待后完成的 worker 超过 Gloo 默认 1800s 超时，触发 `DistStoreError`
+- **解决**：将 `init_device_mesh()` 从 `_build_rollout()` 移到 `__init__()` 中 `mpu.initialize_model_parallel()` 之后、模型加载之前（见 3.5 节）
+- **注意**：单纯增加 `nccl_timeout` 无法解决此问题，因为超时发生在 Gloo 后端而非 NCCL
+
+### 问题 19：NCCL/RCCL 环境变量未传播到 Ray workers（多节点）
+
+- **现象**：多节点训练中部分 worker 的 RCCL 行为与 head 节点不一致，可能导致通信 hang 或性能退化
+- **原因**：Ray worker 进程不继承 head 节点的 shell 环境变量，NCCL/RCCL 优化参数（如 `NCCL_MIN_NCHANNELS`、`RCCL_MSCCL_ENABLE`）丢失
+- **解决**：修改 `verl/trainer/constants_ppo.py`，在 `get_ppo_ray_runtime_env()` 中自动传播以 `NCCL_`/`RCCL_` 等前缀开头的环境变量（见 3.4 节）
 
 ---
 
