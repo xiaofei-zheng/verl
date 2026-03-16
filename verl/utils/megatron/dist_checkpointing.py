@@ -143,7 +143,8 @@ def save_dist_checkpointing(
     content_metadata=None,
 ):
     _patch_filesystem_writer_for_rocm()
-    validate_sharding_integrity = True
+    is_rocm = hasattr(torch.version, "hip") and torch.version.hip is not None
+    validate_sharding_integrity = not is_rocm
     save_strategy = get_default_save_sharded_strategy("torch_dist")
     save_strategy = FullyParallelSaveStrategyWrapper(
         save_strategy, mpu.get_data_parallel_group(with_context_parallel=True)

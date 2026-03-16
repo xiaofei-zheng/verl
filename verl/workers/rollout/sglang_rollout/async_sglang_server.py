@@ -27,6 +27,8 @@ import torch
 
 def _is_rocm() -> bool:
     return hasattr(torch.version, 'hip') and torch.version.hip is not None
+
+
 from packaging import version
 from ray.actor import ActorHandle
 from sglang.srt.entrypoints.http_server import (
@@ -197,7 +199,7 @@ class SGLangHttpServer:
             "dtype": self.config.dtype,
             "mem_fraction_static": self.config.gpu_memory_utilization,
             "disable_cuda_graph": self.config.enforce_eager,
-            "enable_memory_saver": False,
+            "enable_memory_saver": self.config.get("free_cache_engine", False),
             "base_gpu_id": self.base_gpu_id,
             "gpu_id_step": 1,
             "tp_size": infer_tp,
@@ -258,6 +260,7 @@ class SGLangHttpServer:
         # NOTE: We can't directly call SGLang's launch_server since it's not an async function.
         # https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/entrypoints/http_server.py
         sglang.srt.entrypoints.engine._set_envs_and_config = _set_envs_and_config
+
         os.environ["SGLANG_BLOCK_NONZERO_RANK_CHILDREN"] = "0"
         server_args = ServerArgs(**args)
         if version.parse(sglang.__version__) >= version.parse("0.5.7"):

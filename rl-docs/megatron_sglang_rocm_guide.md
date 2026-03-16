@@ -401,7 +401,7 @@ ppo_mini_batch_size <= train_batch_size
   ```
   脚本工作流程：初始化 Megatron (EP=8) → CPU 创建模型 → 加载 dist_ckpt → 提取 HF 格式权重 → 各 rank 将 expert 权重写入 NFS 临时文件 → rank 0 合并保存为 safetensors
 
-### 问题 18：6 节点 235B 训练 init_device_mesh DistStoreError（多节点）
+### 问题 18：6 节点   B 训练 init_device_mesh DistStoreError（多节点）
 
 - **现象**：6 节点 48 GPU 训练 Qwen3-235B 时，初始化阶段卡住 30 分钟后报 `torch.distributed.DistStoreError: wait timeout after 1800000ms`，错误发生在 `init_device_mesh` → `new_group()` 调用
 - **根因**：
@@ -494,12 +494,414 @@ step time 分解（30B 2节点）：
 
 9 道分歧题 RL 全部答对，Base 全部答错。RL 训练不仅提升了推理能力，还改善了输出格式规范性（如 `75.00` → `75`）。
 
+### 问题 20：8 节点 235B sglang init_memory_pool OOM
+
+- **现象**：sglang 初始化 KV cache 时报 `RuntimeError: Not enough memory. mem_fraction_static=0.51`
+- **根因**：verl 混合引擎中，actor 模型（EP=8, param_offload=False）占 ~72GB/GPU，sglang 模型（TP=8）占 ~59GB/GPU，合计 ~131GB。sglang 的 `gpu_memory_utilization` 控制其显存预算，但 sglang 会把 actor 的显存也算进 "model weights"，导致预算不够
+- **尝试过的值**：gpu_memory_utilization=0.35（预算 85GB < 131GB → OOM）、0.5（122GB < 131GB → OOM）、0.6（147GB > 131GB 但仍不够，可能 NCCL 缓冲区等额外开销）
+- **解决**：`gpu_memory_utilization=0.82`（预算 200GB）通过了 sglang init
+- **关键对比**：30B 模型 actor+sglang 仅 22.5GB/GPU，`gpu_memory_utilization=0.6` 轻松够用
+
+### 问题 21：8 节点 235B ref 计算 GPU OOM（free_cache_engine 未生效）
+
+- **现象**：sglang init 通过后，`ref_compute_ref_log_prob` 报 `torch.OutOfMemoryError: 219.28 GiB allocated, 0 bytes free`
+- **根因**：actor(72GB) + sglang model(59GB) + KV cache(~88GB) = 219GB，ref 模型 forward 需要额外 ~72GB → 超过 288GB
+- **关键发现**：`free_cache_engine=True` 应该在 ref 计算前释放 KV cache，但**实际未生效**。可能是 verl 的 Megatron 混合引擎中 free_cache_engine 的生命周期管理有 bug
+- **尝试 actor param_offload=True**：可以解决 GPU OOM，但导致 **CPU 内存 OOM**（每 worker offload ~144GB 到 CPU，8 workers/节点 = 1.15TB → 超出 cgroup 限制）
+- **尝试 val_before_train=False**：跳过初始验证，但训练循环中 ref 计算同样 OOM
+- **最终方案**：使用 PP=2 减半 actor 显存（见问题 22）
+
+### 问题 22：PP=2 解决显存但引入 NCCL pipeline 超时
+
+- **解决方案**：`TRAIN_PP=2`，actor 94 层分成 2 个 PP stage（47 层/stage），每 GPU actor 从 72GB 降到 ~36GB
+- **效果**：PP=2 + gpu_memory_utilization=0.6 成功跑通 step 1
+  - GPU 显存：143.2 GB allocated / 145.7 GB reserved（288GB 中只用一半）
+  - Step time：143.8s，吞吐 52.6 tok/s，score 28.7%
+- **新问题**：step 1 完成后，step 2 的 PP 跨节点通信 hang 30 分钟后超时
+  - `PIPELINE_MODEL_PARALLEL_GROUP Rank 1: Watchdog caught collective operation timeout: ran for 1800007ms`
+  - PP=2 要求跨节点 pipeline 通信（send/recv between PP stages），但 RCCL 跨节点 P2P 不稳定
+- **状态**：待进一步调查 PP 跨节点通信问题，或寻找不用 PP 的替代方案
+
+### 235B 8 节点显存分析
+
+Qwen3-235B-A22B 模型参数（`moe_intermediate_size=1536`，非 `intermediate_size=12288`）：
+- 非专家参数（attention + embed + lm_head）：~8B
+- 专家参数（128 experts × 94 layers × 3 × 4096 × 1536）：~227.5B
+- 总计：~235.5B
+
+每 GPU 显存占用（288GB VRAM）：
+
+| 组件 | PP=1,EP=8,TP=1 | PP=2,EP=8,TP=1 |
+|------|----------------|----------------|
+| Actor | 8B+28.4B=36.2B → **72GB** | ~18B → **36GB** |
+| Sglang (TP=8) | 29.4B → **59GB** | **59GB** |
+| 合计 | **131GB** (45%) | **95GB** (33%) |
+| + Ref (forward) | +72GB → **203GB** | +36GB → **131GB** |
+| + KV cache | OOM | 余量充足 |
+
+### 问题 23：`torch_memory_saver` v0.0.5 API 不兼容 sglang（根因）
+
+- **现象**：`enable_memory_saver=True` 时 sglang scheduler 报 `AttributeError: module 'torch_memory_saver' has no attribute 'torch_memory_saver'`
+- **根因**：verl 的 Docker 镜像安装了 `torch_memory_saver_numa` v0.0.5（旧的 ROCm fork），缺少 sglang 要求的 tag-based API：
+  - 无 `torch_memory_saver.torch_memory_saver` 模块级属性
+  - `region()`/`pause()`/`resume()` 不接受 `tag` 参数
+  - 无 `cuda_graph()`/`disable()` 方法
+- **解决**：从主仓库 `fzyzcjy/torch_memory_saver` 源码构建 v0.0.9（PR #43 已包含 ROCm 支持，2025年8月合并）
+  ```bash
+  export HIPCC_COMPILE_FLAGS_APPEND="--amdgpu-target=gfx950 -D__HIP_PLATFORM_AMD__"
+  export CFLAGS="-D__HIP_PLATFORM_AMD__"
+  export CXXFLAGS="-D__HIP_PLATFORM_AMD__"
+  pip install git+https://github.com/fzyzcjy/torch_memory_saver.git --no-deps --force-reinstall
+  ```
+- **验证**：v0.0.9 在 ROCm 7.0 / gfx950 上 tag-based pause/resume 正确释放物理显存（测试 535MB 释放+恢复，数据完整）
+- **注意**：每个节点的容器需要独立安装（容器本地 `/opt/venv/`），训练脚本通过 Ray preflight 在所有节点自动安装
+- **参考**：`fzyzcjy/torch_memory_saver` PR #43, PR #14; `verl-project/verl` PR #1464
+
+### 问题 24：跨节点逐层通信 hang（TP>1, PP>1）
+
+- **现象**：TP=2 或 PP=2 时，训练在 `compute_log_prob` 或 step 2 hang（GPU 100% 但 Memory bandwidth 0%，30分钟后 NCCL 超时）
+- **根因**：TP 和 PP 要求**逐层跨节点通信**（TP all-reduce 每层 2 次 × 94 层 = 188 次/forward，PP send/recv 每层）。这种高频小块跨节点通信模式在 RCCL + AINIC 网络上 hang
+- **对比**：30B 用 TP=1 EP=8 DP=8 在同一集群正常运行，因为只有 DP gradient sync（一次性大块跨节点通信）能正常工作
+- **结论**：当前集群可行配置限制为 **TP=1, PP=1**（节点内模型并行），只有 DP 做跨节点通信
+- **待查**：RCCL/AINIC 的逐层跨节点 P2P 通信问题
+
+### 问题 25：`gpu_memory_utilization` 与 `enable_memory_saver` 的 tradeoff
+
+- **矛盾**：sglang init 需要 `gpu_memory_utilization≥0.82` 才能通过（actor 73GB + sglang 59GB + NCCL overhead ≈ 170GB+），但 0.82 分配了 ~70GB KV cache，使得 ref 阶段 VRAM 接近 99%
+- **memory_saver 部分有效**：v0.0.9 的 `pause(tag="kv_cache")` 确实释放了物理显存（观察到 VRAM 从 87% 降到 41%），但 ref forward 时 actor(73GB) + ref 参数从 CPU 加载(73GB) + 残留分配 → 重新填满到 99%
+- **expandable_segments 无关**：去掉 `PYTORCH_HIP_ALLOC_CONF=expandable_segments:True` 未改善问题
+- **状态**：需要进一步调查 ref forward 阶段为什么 VRAM 重新填满到 99%（memory_saver 释放了 KV cache 但可能未释放 sglang model weights，或 ref param_offload 的 CPU→GPU 加载策略有问题）
+
+### 问题 26：`torch_memory_saver` v0.0.5 → v0.0.9 升级（ROCm 适配）
+
+- **根因**：verl Docker 镜像中的 `torch_memory_saver_numa` v0.0.5 缺少 sglang 要求的 tag-based API
+- **解决**：从 `fzyzcjy/torch_memory_saver` 主仓库源码构建 v0.0.9（PR #43 包含 ROCm/HIP 支持）
+  ```bash
+  export HIPCC_COMPILE_FLAGS_APPEND="--amdgpu-target=gfx950 -D__HIP_PLATFORM_AMD__"
+  pip install git+https://github.com/fzyzcjy/torch_memory_saver.git --no-deps --force-reinstall
+  ```
+- **验证**：v0.0.9 在 ROCm 7.0 / gfx950 上 tag-based pause/resume 正确释放物理显存（535MB 测试通过）
+- **部署**：训练脚本通过 Ray preflight 在所有节点自动安装（容器重启后需重新安装）
+
+### 问题 27：ref_compute_ref_log_prob 阶段 VRAM 重新填满（核心阻塞问题）
+
+- **现象**：`enable_memory_saver=True` + v0.0.9 下，generation 完成后 `sleep_replicas` 成功将 VRAM 从 87% 降到 41%，`compute_old_log_prob` 正常完成，但 `ref_compute_ref_log_prob` 阶段 VRAM 涨回 95-99% 并 crash（SYSTEM_ERROR / GPU hang）
+- **15 次运行对比得出的结论**：
+  - `gpu_memory_utilization < 0.82` → sglang init OOM（预算不够 actor 73GB + sglang 59GB + overhead）
+  - `gpu_memory_utilization ≥ 0.82` → sglang init 通过，但分配 ~70GB KV cache → ref 阶段 VRAM 满
+  - `enable_memory_saver` 释放了 KV cache 物理内存（VRAM 降到 41%），但 ref forward 时 VRAM 重新涨到 99%
+- **疑似根因**：`enable_memory_saver` 可能只释放了 KV cache（~70GB）但**未释放 sglang model weights（59GB）**，导致 ref 阶段实际显存为 actor(73GB) + sglang_weights(59GB) + ref(73GB) + overhead ≈ 240GB → 接近 288GB
+- **actor param_offload=True 尝试**：可以解决 GPU 显存问题（actor 不占 GPU），但需要 CPU 内存 ≥ 2.8TB/节点（8 workers × ~250GB RSS）
+- **官方 235B 示例对比**：官方用 vLLM（不是 sglang） + PP=8 + TP=4 + param_offload=True，完全不同的架构
+
+### 235B 8 节点 15 次运行总结
+
+| 阶段 | 状态 | 有效配置 |
+|------|------|---------|
+| sglang init | 已解决 | `gpu_memory_utilization=0.82` |
+| generation | 已解决 | TP=1 EP=8（节点内），GPU 100% 正常推理 |
+| sleep_replicas 释放显存 | 已解决 | `enable_memory_saver=True` + v0.0.9，VRAM 87%→41% |
+| compute_old_log_prob | 已解决 | 正常完成 |
+| **ref_compute_ref_log_prob** | **未解决** | VRAM 涨回 99% 后 crash |
+| 跨节点 TP>1/PP>1 | 不可行 | RCCL 逐层跨节点通信 hang |
+
+---
+
+### 235B 8 节点集群重启后排查（2026-03-13 ~ 03-14）
+
+排除坏节点 10.158.172.63 后集群重启，新一轮 debug（~6 次尝试）：
+
+#### 问题 1：update_weights 阶段 Actor 进程被杀
+
+- **现象**：进入 `trainer.fit()` → `checkpoint_manager.update_weights()` 后，Ray actor 死亡
+- **错误类型**：前两次 `ActorDiedError`（worker 进程 SIGKILL），第三次 `ActorUnavailableError`（RPC Socket closed）
+- **每次死亡节点不同**：10.158.169.78 → 10.158.169.78 → 随机，说明不是特定坏节点
+- **根因分析**：`update_weights` 调用链内存极高
+  - `per_tensor_generator` 中 EP=8 的 `all_gather` 把 128 个 expert 权重在每个 rank 上重组
+  - `get_named_tensor_buckets` 对每个 tensor 做 `clone()`，每 bucket 2GB 额外拷贝
+  - actor(~58GB/rank) + sglang weights + clone buffer 同时在 GPU → OOM
+- **尝试的优化**：
+  - `update_weights_bucket_megabytes` 从 2048 → 512 → 256
+  - `gpu_memory_utilization` 从 0.82 → 0.6
+  - `enable_memory_saver=True`（sglang 侧 TMS 释放权重）
+  - `use_mbridge=True`（绕过 per_tensor_generator 的 EP all_gather）
+  - 增加 Ray 超时（health check 300s, gRPC 900s）
+
+#### 问题 2：torch_memory_saver v0.0.5 vs v0.0.9 不兼容
+
+- **现象**：`AttributeError: module 'torch_memory_saver' has no attribute 'torch_memory_saver'`
+- **原因**：集群重启后新 pod 自带 v0.0.5（镜像默认），sglang 需要 v0.0.9
+- **preflight 不可靠**：pip install from git 在部分节点超时（>300s），安装不一致
+- **解决方案**：**禁用 `enable_memory_saver=False`**，完全避免 TMS 依赖
+- **代价**：sglang 不能在 sleep 时释放 model weights，但 `free_cache_engine=True` 仍能释放 KV cache
+
+#### 问题 3（最新）：update_actor OOM — 真正的瓶颈
+
+- **现象**：`update_weights` 成功通过，但 `_update_actor` → `load_megatron_model_to_gpu` 时 OOM
+- **错误**：`Tried to allocate 105.75 GiB. GPU has 287.98 GiB total, 83.05 GiB free`
+- **根因**：`enable_memory_saver=False` 时，sglang model weights（~160GB/8GPU）没被释放；actor 要加载 params+grad 需要 ~106GB，只有 83GB 空闲
+- **显存占用分析**（288GB/GPU）：
+
+| 组件 | 占用 | 说明 |
+|------|------|------|
+| sglang weights（未释放） | ~160 GB | 无 memory_saver，weights 常驻 |
+| KV cache（已释放） | 0 GB | free_cache_engine=True |
+| PyTorch 分配 | ~45 GB | actor ref/其他 |
+| **剩余** | ~83 GB | 不够 actor 105GB |
+
+- **解决方向**：
+  1. **修复 TMS 安装**：用 NFS 上预编译 wheel 替代 git install，保证 `enable_memory_saver=True` 可用
+  2. **降低 actor grad 占用**：只加载 params 不加载 grad（`load_grad=False`），但 update_actor 需要 grad
+  3. **降低 gpu_memory_utilization 到 0.4-0.5**：让 sglang weights 占更少
+  4. **切换 vLLM**：官方 235B 方案用 vLLM，其 weight sync 不需要 TMS
+
+### 当前配置快照（最新尝试）
+
+```bash
+# 并行
+NNODES=8, TP=1, EP=8, PP=1, DP=8, ROLLOUT_TP=8
+
+# 显存
+param_offload=True, optimizer_offload=True, grad_offload=True
+gpu_memory_utilization=0.6, free_cache_engine=True
+enable_memory_saver=False  # 禁用以避免 TMS 依赖
+update_weights_bucket_megabytes=256
+
+# 优化
+use_mbridge=True  # 高效权重转换，绕过 per_tensor_generator EP all_gather
+```
+
+### 后续修复（2026-03-14 凌晨）
+
+#### TMS NFS Wheel 方案（已验证可行）
+- 在 head 节点 `pip wheel git+https://github.com/fzyzcjy/torch_memory_saver.git --no-deps -w /shared_nfs/xiaofei/wheels/`
+- Preflight 从 NFS 安装：16 秒装完 8 节点，100% 成功率
+- SGLang 启动成功，`enable_memory_saver=True` 生效
+- 显存释放后 sglang CUDA graph capture 可用内存 136.76 GB
+
+#### vLLM 切换尝试（失败）
+- vLLM v0.9.2 (rocm700 build) 存在多个 ROCm 不兼容问题：
+  - `is_sleep_mode_available()` 返回 False（已 patch）
+  - `cutlass_scaled_mm_supports_fp8` 不存在（CUTLASS 是 NVIDIA 的，`is_cuda()` 在 ROCm 上返回 True 触发）
+  - `vllm.vllm_flash_attn.layers` 模块不存在
+- **结论**：当前环境的 vLLM 在 ROCm 上不可用作 rollout，需要 sglang
+
+#### 当前瓶颈：Ray RPC 网络不稳定（ActorUnavailableError）
+- `enable_memory_saver=True` + `mbridge=True` + NFS wheel → SGLang 初始化成功，进入训练循环
+- `update_weights` 跑了 ~20 分钟（传输 235B 权重），然后 `ActorUnavailableError: Socket closed`
+- **不是内存问题，不是代码问题——是集群网络稳定性问题**
+- 235B 的 update_weights 需要通过 Ray RPC 传输大量数据（EP=8 all_gather + bucket transfer），长时间的阻塞操作容易被网络抖动打断
+
+### 下一步方案
+
+1. **集群网络排查**：联系 infra 团队检查 8 节点间的 RDMA/IB 网络稳定性
+2. **NCCL checkpoint engine**：用 `backend=nccl` 替代 `naive`，通过 NCCL 传输权重（比 Ray RPC 更稳定）
+3. **减少 update_weights 时间**：增大 `update_weights_bucket_megabytes`（当前 256，可以试 1024），减少 RPC 往返次数
+4. **重试机制**：在 verl 的 `update_weights` 调用处添加重试逻辑
+
+---
+
+### 235B 4 节点训练成功跑通（2026-03-14）
+
+#### 方案概述
+
+放弃 8 节点 TP=1 PP=1 EP=8 DP=8 方案（Ray RPC 在 update_weights 跨 DP 组同步时超时），改用官方推荐的 4 节点 (32 GPU) 配置：
+
+| 参数 | 8 节点（失败） | 4 节点（成功） |
+|------|---------------|---------------|
+| TP | 1 | **4** |
+| PP | 1 | **8** |
+| EP | 8 | **4** |
+| DP | 8 | **1** |
+| Rollout | sglang TP=8 | sglang TP=8 |
+| OFFLOAD_FRACTION | 1 | 1 |
+
+关键改进：DP=1 意味着 `update_weights` 不需要跨 DP 组同步（8 节点 DP=8 需要 64 个 worker 协调 → Ray RPC 超时），只需要 1 个模型副本内部的 rollout↔training 权重同步。
+
+#### 并行策略分析
+
+```
+32 GPUs = TP(4) × PP(8) × DP(1)
+EP=4 fits within TP×DP = 4×1 = 4 GPUs per PP stage
+每个 PP stage: 94/8 ≈ 12 层, 分布在 4 个 GPU (TP=4, EP=4)
+```
+
+PP=8 需要跨节点 pipeline 通信（send/recv），但比 TP 的 all-reduce 更轻量。之前问题 24 记录的 "TP>1/PP>1 跨节点通信 hang" 在 4 节点配置下**未复现**。
+
+#### 基于官方脚本
+
+基于 `examples/grpo_trainer/run_qwen3-235b_megatron_96gb.sh`，适配 ROCm：
+
+- **Rollout**: vLLM → **sglang**（vLLM 在 ROCm 上不可用，见问题 vLLM 切换尝试）
+- **去掉 NVIDIA-only fused kernels**: `moe_enable_deepep`, `moe_permute_fusion`, `gradient_accumulation_fusion`, `apply_rope_fusion`, `moe_token_dispatcher_type=flex`
+- **保留 ROCm 环境变量**: RCCL 网络配置、TMS NFS wheel 安装
+- **保留**: `enable_memory_saver=True`, `use_mbridge=True`, `attention_backend=flash`
+- **保留官方 batch config**: `train_batch_size=32`, `mini_batch=16`, `n=8`, `lr=1e-6`
+
+脚本已删除（被 `rl-scripts/run_megatron_235b_8node_4gpu.sh` 取代）
+
+#### 训练结果（前 9 步）
+
+| 指标 | 值 |
+|------|------|
+| 节点数 | 4 (32 GPU, MI355X 288GB) |
+| 训练步数 | 9/233（step 10 checkpoint 保存时崩溃） |
+| 初始 GSM8K Score | ~43% |
+| Step 9 Score | **63.7%** |
+| 平均 step time | ~350s (~5.8 min) |
+| 平均吞吐量 | ~37-43 tok/s |
+| GPU 显存 | 51.5 GB allocated / 72.8 GB reserved (288GB 中) |
+| CPU 内存 | ~1545-1598 GB (4 节点合计) |
+| update_weights 时间 | ~91s/step（**稳定，无超时**） |
+| update_actor 时间 | ~34s/step |
+| gen (sglang) 时间 | ~197s/step |
+| 预计总训练时间 | ~22.5 小时 |
+
+Step time 分解（235B 4 节点，以 step 2 为例）：
+
+| 阶段 | 时间 | 占比 |
+|------|------|------|
+| gen（sglang rollout） | ~198s | 58% |
+| update_weights（权重同步） | ~91s | 27% |
+| update_actor（训练） | ~34s | 10% |
+| old_log_prob | ~11s | 3% |
+| ref | ~8s | 2% |
+
+#### 已知问题：Checkpoint 保存崩溃
+
+训练循环稳定运行，但 `save_freq=10` 在 step 10 触发 `_save_checkpoint()` 时崩溃：
+
+```
+ray.exceptions.ActorUnavailableError: Socket closed
+调用链: trainer.fit() → _save_checkpoint() → actor_rollout_wg.save_checkpoint() → ray.get(output)
+```
+
+根因分析：
+1. **不是 SIGSEGV**（ROCm fork→thread 补丁已生效）
+2. **不是 HF 格式 all_gather hang**（dist_checkpointing 格式已强制启用）
+3. **是 Ray RPC 超时**：235B 模型 32 个 worker 同时向 NFS 写入 dist_ckpt（30B 用了 ~281s/次，235B 预计更久），worker 在写入期间不响应 Ray keepalive → Socket closed
+
+**深层根因**（GCS 日志分析）：
+
+不是 Ray RPC 超时，而是**远程节点 10.158.171.199 的 raylet 进程完全崩溃**：
+
+```
+11:41:57 GCS: Connection is broken. node_id=6a577...
+11:41:58 GCS: Health check FAILED for node 6a577...
+         ipv4:10.158.171.199:33151: Connection refused
+11:42:07 GCS: Destroying actor a096d5ca... (on crashed node)
+```
+
+同时 head 节点 raylet 持续报 `memory_monitor.cc: Got negative used memory for cgroup -1`（cgroup 内存监控异常）。推测崩溃原因：
+
+1. 训练期间 CPU 内存 ~400 GB/节点（4 节点合计 1598 GB）
+2. `save_checkpoint` → `load_megatron_model_to_gpu(load_grad=True)` + `save_dist_checkpointing` 的 NFS 写入缓冲 → CPU 内存峰值超过 cgroup 限制
+3. Linux OOM Killer 终止了该节点的 raylet 进程
+4. **与 30B 的 SIGSEGV/fork 问题是完全不同的根因**（30B CPU 内存仅 ~274 GB/节点，远低于限制）
+
+另外 `save_dist_checkpointing` 流程中有两处 `all_gather_object` 跨 32 rank 集合通信（`validate_access_integrity`），可能加剧内存压力。
+
+潜在修复方向：
+1. **减少 save 时 CPU 峰值**：`load_grad=False`（只保存 params 不保存 grad）
+2. **跳过 validation**：`validate_access_integrity=False` 减少 `all_gather_object` 内存开销
+3. **增大 cgroup memory limit**：联系 infra 调整容器内存限制
+4. **异步 checkpoint**：`async_save=True` 避免阻塞
+
+临时解决方案：`save_freq=-1` 跳过 checkpoint 保存，让训练先跑通（预计 ~22.5 小时）。
+
+### 问题 28：save_checkpoint 时 ROCm HIP RSS 膨胀导致 cgroup OOM（根因与解决）
+
+- **根因深入分析**：
+  1. ROCm HIP 将 GPU 显存映射到进程虚拟地址空间，导致每个 worker 的 RSS 包含 GPU 显存占用（每 worker ~350GB）
+  2. 原代码 `save_checkpoint` 调用 `load_megatron_model_to_gpu(self.actor_module)` 将 offload 到 CPU 的参数重新加载到 GPU → 新增 GPU 显存 → RSS 膨胀
+  3. 4 节点 × 8 GPU/节点 = 8 workers/节点，RSS 总量 ~2800GB ≈ cgroup 限制，任何额外分配都触发 OOM
+- **解决方案 1：CPU-based checkpoint save**（代码修改）
+  - 新增 `_swap_params_to_cpu_for_save()` 方法，直接使用 CPU offload 副本生成 state_dict，完全避免 GPU 分配
+  - 修改 `save_checkpoint()` 调用流程：跳过 `load_megatron_model_to_gpu()`，改用 CPU swap
+  - **文件**: `verl/workers/megatron_workers.py`
+- **解决方案 2：减少每节点 worker 数量**
+  - 从 4 节点 × 8 GPU 改为 **8 节点 × 4 GPU**，总 GPU 数不变（32 张）
+  - 每节点 4 workers × 350GB = 1400GB，远低于 cgroup 限制，留出 1400GB 余量
+  - 代价：占用更多节点，GPU 4-7 空闲
+- **解决方案 3：跳过 ROCm 上的 sharding validation**
+  - `save_dist_checkpointing` 中的 `validate_sharding_integrity` 调用 `all_gather_object` 收集所有 rank 的 sharding 信息，内存开销大
+  - ROCm 上禁用此验证：`validate_sharding_integrity = not is_rocm`
+  - **文件**: `verl/utils/megatron/dist_checkpointing.py`
+- **最终配置**：方案 1 + 方案 2 + 方案 3 组合使用，checkpoint 保存稳定通过
+- **脚本见**: `rl-scripts/run_megatron_235b_8node_4gpu.sh`（包含 inline patch，打入镜像后可去掉）
+
+### 235B 4 节点 train_only 完整训练（2026-03-14 ~ 03-15）
+
+使用 `save_freq=-1` 跳过 checkpoint 保存，验证训练循环本身可以跑通：
+
+| 指标 | 值 |
+|------|------|
+| 脚本 | `rl-scripts/run_megatron_235b_4node_train_only.sh` |
+| 节点数 | 4 (32 GPU, MI355X 288GB) |
+| 并行策略 | TP=4, PP=8, EP=4, DP=1 |
+| 训练步数 | **233/233（100% 完成）** |
+| 总训练时间 | **17 小时 42 分钟** |
+| 平均 step time | ~273s (~4.5 min) |
+| 最终 score/mean | ~0.95（95%） |
+| Checkpoint | 无（save_freq=-1） |
+
+**结论**：训练循环完全稳定，233 步无任何 crash。问题仅在 checkpoint 保存阶段。
+
+### 235B 8 节点 × 4GPU 完整训练（最终方案，2026-03-15 ~ 03-16）
+
+应用 CPU-save patch + 8 节点 4GPU 配置，训练 + checkpoint 保存全部跑通：
+
+| 指标 | 值 |
+|------|------|
+| 脚本 | `rl-scripts/run_megatron_235b_8node_4gpu.sh` |
+| 节点数 | 8 (每节点 4 GPU, 共 32 GPU) |
+| 并行策略 | TP=4, PP=8, EP=4, DP=1; Rollout TP=8 |
+| 训练步数 | **233/233（100% 完成）** |
+| 总训练时间 | **16 小时 50 分钟** |
+| 平均 step time | ~280-330s (~5 min) |
+| 最终 score/mean | ~0.95（95%） |
+| Checkpoint 保存 | **全部成功**（save_freq=50） |
+
+Checkpoint 保存记录：
+
+| Checkpoint | 耗时 | 状态 |
+|------------|------|------|
+| global_step_50 | ~35 min | OK |
+| global_step_100 | ~35 min | OK |
+| global_step_150 | ~35 min | OK |
+| global_step_200 | ~35 min | OK |
+| global_step_233（最终） | ~40 min | OK |
+
+Checkpoint 大小分析：
+
+| 内容 | 精度 | 大小 |
+|------|------|------|
+| 模型权重 | bf16 | ~470 GB |
+| Adam optimizer momentum | fp32 | ~940 GB |
+| Adam optimizer variance | fp32 | ~940 GB |
+| fp32 master weights | fp32 | ~940 GB |
+| **单个 checkpoint 总计** | | **~3 TB** |
+
+每个 checkpoint 包含 66 个 `.distcp` 文件（32 rank × 2 bucket），每文件 46-49 GB。`max_ckpt_to_keep` 自动清理旧 checkpoint，最终保留 global_step_200 和 global_step_233。
+
+**结论**：这是 Qwen3-235B 在 ROCm MI355X 上的首次完整 RL 训练 + checkpoint 保存成功。
+
 ---
 
 ## 7. 已知问题与待解决项
 
-1. **EP/TP 优化**：当前 EP=8/TP=1，Megatron 和 sglang 的模型切法不同（EP vs TP），update_weights 需要复杂的 expert 重映射（~20s/step，占 34%）。降低 EP 提高 TP 可能减少重分片开销
-2. **Checkpoint 保存性能**：线程写入 ~281s/次，优化方向包括只保存 model 权重（跳过 optimizer）、减少保存频率
-3. **async 训练**：verl 支持 sglang async rollout，可能提升整体 pipeline 效率
-4. **ref 模型 offload**：关闭 `ref.megatron.param_offload` 可节省 ~3-4s/step
-5. **dist_ckpt → HF 转换**：verl 缺少内置工具，当前使用自定义脚本 `scripts/converter_mcore_to_hf.py`，建议后续训练在 `save_contents` 中加入 `hf_model` 自动导出
+### 已解决
+
+1. ~~**235B checkpoint 保存 OOM**~~：通过 CPU-save patch + 8 节点 4GPU 配置解决（见问题 28）
+2. ~~**TMS 安装可靠性**~~：NFS 预编译 wheel 方案已验证可行（16 秒装完 8 节点）
+3. ~~**235B 完整训练**~~：233 步 + 5 个 checkpoint 全部成功（见 6.5 节）
+
+### 待优化
+
+1. **Checkpoint 大小**：每个 checkpoint ~3 TB（含 optimizer states），仅模型权重 ~470 GB。如只需推理，可配置只保存模型权重跳过 optimizer（节省 ~85% 空间）
+2. **Checkpoint 保存耗时**：单次 ~35-40 分钟（235B 写入 NFS），占训练时间 ~4%
+3. **每节点只用 4 GPU**：当前方案 GPU 4-7 空闲，未来修复 ROCm HIP RSS 映射问题或调高 cgroup 限制后可改回 8 GPU/节点
+4. **EP/TP 优化**：当前 TP=4 EP=4，update_weights 需要 expert 重映射。进一步优化 EP/TP 比例可能减少重分片开销
+5. **async 训练**：verl 支持 sglang async rollout，可能提升整体 pipeline 效率
+6. **dist_ckpt → HF 转换**：verl 缺少内置工具，当前使用自定义脚本 `scripts/converter_mcore_to_hf.py`
+7. **代码修改需打入镜像**：3 个 ROCm 适配修改（`async_sglang_server.py`、`megatron_workers.py`、`dist_checkpointing.py`）目前由训练脚本 inline patch，打新镜像时应直接包含这些修改

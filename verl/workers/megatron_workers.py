@@ -953,20 +953,99 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
     def load_pretrained_model(self, checkpoint_path, del_local_after_load=True):
         pass
 
+    def _swap_params_to_cpu_for_save(self):
+        """Replace empty GPU param views with CPU data for checkpoint saving.
+
+        On ROCm, HIP maps GPU memory into the process virtual address space,
+        inflating RSS. With 8 workers/node near the cgroup limit, any GPU
+        allocation during save triggers OOM. This method avoids GPU allocation
+        entirely by pointing each model parameter at its CPU offload copy,
+        so sharded_state_dict() and dist_checkpointing.save() operate on CPU.
+
+        Returns list of (param, original_gpu_view) for restoration.
+        """
+        from megatron.core.distributed import DistributedDataParallel as MCoreDDP
+
+        saved_params = []
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        n_swapped = 0
+        for model_chunk in self.actor_module:
+            if not isinstance(model_chunk, MCoreDDP):
+                continue
+            for buffers in [model_chunk.buffers, model_chunk.expert_parallel_buffers]:
+                for buffer in buffers:
+                    if buffer.param_data.storage().size() > 0:
+                        continue
+                    if not hasattr(buffer.param_data, "cpu_data"):
+                        continue
+
+                    cpu_data = buffer.param_data.cpu_data
+                    buf_offset = buffer.param_data.storage_offset()
+
+                    for param in buffer.params:
+                        orig_view = param.data
+                        param_offset = orig_view.storage_offset() - buf_offset
+                        cpu_view = cpu_data[param_offset : param_offset + param.numel()].view(
+                            orig_view.shape
+                        )
+                        saved_params.append((param, orig_view))
+                        param.data = cpu_view
+                        n_swapped += 1
+        if rank == 0:
+            logger.info(f"[CPU-save] swapped {n_swapped} params to CPU for checkpoint save")
+        return saved_params
+
+    def _restore_params_after_save(self, saved_params):
+        """Restore parameters to their original empty GPU views after save."""
+        for param, orig_view in saved_params:
+            param.data = orig_view
+
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def save_checkpoint(self, checkpoint_path, hdfs_path=None, global_step=0, max_ckpt_to_keep=None):
+        import gc
+        import os
+
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        if rank == 0:
+            rss_mb = 0
+            try:
+                with open(f"/proc/{os.getpid()}/status") as f:
+                    for line in f:
+                        if line.startswith("VmRSS:"):
+                            rss_mb = int(line.split()[1]) // 1024
+                            break
+            except Exception:
+                pass
+            logger.info(
+                f"[CPU-save] save_checkpoint START, RSS={rss_mb}MB, "
+                f"GPU_alloc={torch.cuda.memory_allocated()/(1024**3):.1f}GB, "
+                f"GPU_reserved={torch.cuda.memory_reserved()/(1024**3):.1f}GB"
+            )
+
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        saved_params = None
         if self._is_offload_param:
-            load_megatron_model_to_gpu(self.actor_module)
+            saved_params = self._swap_params_to_cpu_for_save()
+
+        if rank == 0:
+            logger.info("[CPU-save] starting checkpoint_manager.save_checkpoint ...")
+
         if self.checkpoint_mananager.checkpoint_config.async_save and self._is_offload_optimizer:
             load_megatron_optimizer(self.actor_optimizer)
         self.checkpoint_mananager.save_checkpoint(
             local_path=checkpoint_path, hdfs_path=hdfs_path, global_step=global_step, max_ckpt_to_keep=max_ckpt_to_keep
         )
         torch.distributed.barrier()
-        if self._is_offload_param:
-            offload_megatron_model_to_cpu(self.actor_module)
+
+        if saved_params is not None:
+            self._restore_params_after_save(saved_params)
         if self.checkpoint_mananager.checkpoint_config.async_save and self._is_offload_optimizer:
             offload_megatron_optimizer(self.actor_optimizer)
+
+        if rank == 0:
+            logger.info("[CPU-save] save_checkpoint DONE")
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def async_calls_finalize_fn_exec(self, blocking=False):
