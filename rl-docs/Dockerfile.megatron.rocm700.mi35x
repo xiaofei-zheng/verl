@@ -60,23 +60,26 @@ RUN git config --global http.postBuffer 524288000 && \
 RUN pip install --no-cache-dir mbridge==0.15.1
 
 # ══════════════════════════════════════════════════════════════════════════════
-# torch_memory_saver — 不安装
-# torch_memory_saver_numa fork 的 API 与 sglang 不兼容（缺少
-# torch_memory_saver.torch_memory_saver 属性），安装后会触发 AttributeError
-# 而非 ImportError，导致 sglang 无法优雅降级。不安装时 sglang 会自动以
-# Noop adapter 运行（verl 也设 memory_saver=False）。
+# torch_memory_saver v0.0.9 (fzyzcjy/torch_memory_saver, PR #43 含 ROCm 支持)
+# 235B 训练必须: enable_memory_saver=True 让 sglang sleep 时释放 GPU 显存
+# 注意: 旧的 torch_memory_saver_numa v0.0.5 不兼容 sglang, 必须用 v0.0.9+
 # ══════════════════════════════════════════════════════════════════════════════
-# --- 预编译 COPY 方式（与 sglang v0.5.6 不兼容，暂禁用）---
-# COPY torch_memory_saver/ /opt/venv/lib/python3.10/site-packages/torch_memory_saver/
-# COPY torch_memory_saver-0.0.5.dist-info/ /opt/venv/lib/python3.10/site-packages/torch_memory_saver-0.0.5.dist-info/
-# COPY torch_memory_saver_cpp.cpython-310-x86_64-linux-gnu.so /opt/venv/lib/python3.10/site-packages/
 
-# --- 从源码编译 torch_memory_saver（备选，同样与 sglang 不兼容）---
-# RUN git clone https://github.com/zhuohan123/torch_memory_saver_numa /tmp/tms && \
-#     cd /tmp/tms && \
-#     sed -i '1i #include <cassert>' csrc/torch_memory_saver_hip.cpp && \
-#     pip install --no-cache-dir . && \
-#     rm -rf /tmp/tms
+# --- 方式 1: 从预编译 wheel 安装（推荐，秒装）---
+# 将 wheel 文件放到 docker build context 目录下
+# cp /shared_nfs/xiaofei/wheels/torch_memory_saver-0.0.9-cp310-cp310-linux_x86_64.whl <context_dir>/
+COPY torch_memory_saver-0.0.9-cp310-cp310-linux_x86_64.whl /tmp/
+RUN pip install --no-cache-dir --no-deps /tmp/torch_memory_saver-0.0.9-cp310-cp310-linux_x86_64.whl && \
+    rm /tmp/torch_memory_saver-0.0.9-cp310-cp310-linux_x86_64.whl && \
+    python3 -c "import torch_memory_saver; print('torch_memory_saver', torch_memory_saver.__version__)"
+
+# --- 方式 2: 从源码编译（备选，需要 ROCm HIP 编译环境）---
+# RUN HIPCC_COMPILE_FLAGS_APPEND="--amdgpu-target=gfx950 -D__HIP_PLATFORM_AMD__" \
+#     CFLAGS="-D__HIP_PLATFORM_AMD__" \
+#     CXXFLAGS="-D__HIP_PLATFORM_AMD__" \
+#     pip install --no-cache-dir --no-deps \
+#         git+https://github.com/fzyzcjy/torch_memory_saver.git && \
+#     python3 -c "import torch_memory_saver; print('torch_memory_saver', torch_memory_saver.__version__)"
 
 # ── Clone and install verl from fork ──
 ARG VERL_REPO=https://github.com/xiaofei-zheng/verl.git
