@@ -40,10 +40,19 @@ PPO_RAY_RUNTIME_ENV = {
 }
 
 
+_NCCL_RCCL_PROPAGATE_PREFIXES = (
+    "NCCL_", "RCCL_", "NCCL_NET_PLUGIN_PATH",
+    "LD_LIBRARY_PATH", "HSA_NO_SCRATCH_RECLAIM",
+    "GPU_MAX_HW_QUEUES", "TORCH_NCCL_HIGH_PRIORITY",
+    "PYTORCH_HIP_ALLOC_CONF", "HIP_VISIBLE_DEVICES",
+)
+
+
 def get_ppo_ray_runtime_env():
     """
     A filter function to return the PPO Ray runtime environment.
     To avoid repeat of some environment variables that are already set.
+    Also propagates NCCL/RCCL env vars from head node to all worker nodes.
     """
     working_dir = (
         json.loads(os.environ.get(RAY_JOB_CONFIG_JSON_ENV_VAR, "{}")).get("runtime_env", {}).get("working_dir", None)
@@ -56,4 +65,9 @@ def get_ppo_ray_runtime_env():
     for key in list(runtime_env["env_vars"].keys()):
         if os.environ.get(key) is not None:
             runtime_env["env_vars"].pop(key, None)
+
+    for key, val in os.environ.items():
+        if any(key.startswith(p) or key == p for p in _NCCL_RCCL_PROPAGATE_PREFIXES):
+            runtime_env["env_vars"][key] = val
+
     return runtime_env

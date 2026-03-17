@@ -156,12 +156,19 @@ class ServerAdapter(BaseRollout):
             f"server address: {server_address}, port: {server_port}"
         )
         host = f"[{server_address}]" if is_valid_ipv6_address(server_address) else server_address
+        server_kwargs = {}
+        if hasattr(self.config, "server") and self.config.server is not None:
+            server_kwargs["timeout"] = getattr(self.config.server, "timeout", 60.0)
+            server_kwargs["max_attempts"] = getattr(self.config.server, "max_attempts", 3)
+            server_kwargs["retry_delay"] = getattr(self.config.server, "retry_delay", 2.0)
+            server_kwargs["max_connections"] = getattr(self.config.server, "max_connections", 2000)
         self._engine = AsyncHttpServerAdapter(
             model_path=self.model_config.local_path,
             host=host,
             port=server_port,
             launch_server=False,
             trust_remote_code=self.model_config.trust_remote_code,
+            **server_kwargs,
         )
 
     async def resume(self, tags: list[str]):

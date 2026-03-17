@@ -293,6 +293,28 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
                     nccl_communicator_config_path=None,
                 )
 
+            # Create rollout device mesh while all workers are still synchronized
+            # (before model loading which causes time divergence across workers).
+            # init_device_mesh is collective — all workers must call new_group()
+            # together. Placing it here avoids Gloo TCP rendezvous timeouts that
+            # occur when workers diverge during large model NFS loading.
+            if self._is_rollout:
+                from torch.distributed.device_mesh import init_device_mesh
+
+                infer_tp = self.config.rollout.tensor_model_parallel_size * self.config.rollout.data_parallel_size
+                infer_pp = self.config.rollout.pipeline_model_parallel_size
+                infer_world_size = infer_tp * infer_pp
+                world_size = torch.distributed.get_world_size()
+                dp = world_size // infer_world_size
+                assert world_size % infer_world_size == 0, (
+                    f"rollout world_size: {world_size} is not divisible by infer_world_size: {infer_world_size}"
+                )
+                self._rollout_device_mesh = init_device_mesh(
+                    get_device_name(),
+                    mesh_shape=(dp, infer_tp, infer_pp),
+                    mesh_dim_names=["dp", "infer_tp", "infer_pp"],
+                )
+
         if self._is_actor or self._is_ref:
             is_collect = (
                 mpu.get_tensor_model_parallel_rank() == 0
@@ -506,24 +528,13 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         return actor_module, actor_optimizer, actor_optimizer_scheduler, self.hf_config, optim_config
 
     def _build_rollout(self, trust_remote_code=False):
-        from torch.distributed.device_mesh import init_device_mesh
-
         # 1. parse rollout and huggingface model config
         rollout_config: RolloutConfig = omega_conf_to_dataclass(self.config.rollout)
         model_config: HFModelConfig = omega_conf_to_dataclass(self.config.model)
 
-        # 2. build rollout device mesh
-        infer_tp = self.config.rollout.tensor_model_parallel_size * self.config.rollout.data_parallel_size
-        infer_pp = self.config.rollout.pipeline_model_parallel_size
-        infer_world_size = infer_tp * infer_pp
-        dp = self.world_size // infer_world_size
-        assert self.world_size % infer_world_size == 0, (
-            f"rollout world_size: {self.world_size} is not divisible by infer_world_size: {infer_world_size}"
-        )
-        rollout_device_mesh = init_device_mesh(
-            get_device_name(), mesh_shape=(dp, infer_tp, infer_pp), mesh_dim_names=["dp", "infer_tp", "infer_pp"]
-        )
-
+        # 2. use rollout device mesh created in __init__ (while workers were
+        #    still synchronized, before model loading caused time divergence)
+        rollout_device_mesh = self._rollout_device_mesh
         self.rollout_device_mesh = rollout_device_mesh
 
         is_collect = (
@@ -664,6 +675,12 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
                 use_dist_checkpointing=self.config.actor.megatron.use_dist_checkpointing,
                 peft_cls=self.peft_cls,
             )
+
+            # Force dist checkpoint format for saving to avoid cross-node
+            # all_gather in mbridge HF save path (EP group spans nodes).
+            if not self.checkpoint_mananager.use_dist_checkpointing:
+                self.checkpoint_mananager.use_dist_checkpointing = True
+                self.checkpoint_mananager.use_hf_checkpoint = False
 
             self.layer_name_mapping = {
                 "qkv_layer_name": "self_attention.linear_qkv.",
@@ -936,20 +953,99 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
     def load_pretrained_model(self, checkpoint_path, del_local_after_load=True):
         pass
 
+    def _swap_params_to_cpu_for_save(self):
+        """Replace empty GPU param views with CPU data for checkpoint saving.
+
+        On ROCm, HIP maps GPU memory into the process virtual address space,
+        inflating RSS. With 8 workers/node near the cgroup limit, any GPU
+        allocation during save triggers OOM. This method avoids GPU allocation
+        entirely by pointing each model parameter at its CPU offload copy,
+        so sharded_state_dict() and dist_checkpointing.save() operate on CPU.
+
+        Returns list of (param, original_gpu_view) for restoration.
+        """
+        from megatron.core.distributed import DistributedDataParallel as MCoreDDP
+
+        saved_params = []
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        n_swapped = 0
+        for model_chunk in self.actor_module:
+            if not isinstance(model_chunk, MCoreDDP):
+                continue
+            for buffers in [model_chunk.buffers, model_chunk.expert_parallel_buffers]:
+                for buffer in buffers:
+                    if buffer.param_data.storage().size() > 0:
+                        continue
+                    if not hasattr(buffer.param_data, "cpu_data"):
+                        continue
+
+                    cpu_data = buffer.param_data.cpu_data
+                    buf_offset = buffer.param_data.storage_offset()
+
+                    for param in buffer.params:
+                        orig_view = param.data
+                        param_offset = orig_view.storage_offset() - buf_offset
+                        cpu_view = cpu_data[param_offset : param_offset + param.numel()].view(
+                            orig_view.shape
+                        )
+                        saved_params.append((param, orig_view))
+                        param.data = cpu_view
+                        n_swapped += 1
+        if rank == 0:
+            logger.info(f"[CPU-save] swapped {n_swapped} params to CPU for checkpoint save")
+        return saved_params
+
+    def _restore_params_after_save(self, saved_params):
+        """Restore parameters to their original empty GPU views after save."""
+        for param, orig_view in saved_params:
+            param.data = orig_view
+
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def save_checkpoint(self, checkpoint_path, hdfs_path=None, global_step=0, max_ckpt_to_keep=None):
+        import gc
+        import os
+
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        if rank == 0:
+            rss_mb = 0
+            try:
+                with open(f"/proc/{os.getpid()}/status") as f:
+                    for line in f:
+                        if line.startswith("VmRSS:"):
+                            rss_mb = int(line.split()[1]) // 1024
+                            break
+            except Exception:
+                pass
+            logger.info(
+                f"[CPU-save] save_checkpoint START, RSS={rss_mb}MB, "
+                f"GPU_alloc={torch.cuda.memory_allocated()/(1024**3):.1f}GB, "
+                f"GPU_reserved={torch.cuda.memory_reserved()/(1024**3):.1f}GB"
+            )
+
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        saved_params = None
         if self._is_offload_param:
-            load_megatron_model_to_gpu(self.actor_module)
+            saved_params = self._swap_params_to_cpu_for_save()
+
+        if rank == 0:
+            logger.info("[CPU-save] starting checkpoint_manager.save_checkpoint ...")
+
         if self.checkpoint_mananager.checkpoint_config.async_save and self._is_offload_optimizer:
             load_megatron_optimizer(self.actor_optimizer)
         self.checkpoint_mananager.save_checkpoint(
             local_path=checkpoint_path, hdfs_path=hdfs_path, global_step=global_step, max_ckpt_to_keep=max_ckpt_to_keep
         )
         torch.distributed.barrier()
-        if self._is_offload_param:
-            offload_megatron_model_to_cpu(self.actor_module)
+
+        if saved_params is not None:
+            self._restore_params_after_save(saved_params)
         if self.checkpoint_mananager.checkpoint_config.async_save and self._is_offload_optimizer:
             offload_megatron_optimizer(self.actor_optimizer)
+
+        if rank == 0:
+            logger.info("[CPU-save] save_checkpoint DONE")
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def async_calls_finalize_fn_exec(self, blocking=False):

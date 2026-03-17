@@ -64,7 +64,10 @@ def get_device_uuid(device_id: int) -> str:
         else:
             return f"NPU-{device_id}"
     else:
-        return current_platform.get_device_uuid(device_id)
+        try:
+            return current_platform.get_device_uuid(device_id)
+        except NotImplementedError:
+            return f"GPU-{device_id}"
 
 
 def get_vllm_max_lora_rank(lora_rank: int):
